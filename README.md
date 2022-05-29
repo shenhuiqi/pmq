@@ -26,7 +26,7 @@ sequenceDiagram
     end
     broker->>queue:put message into topic queue
     broker-->>producer:message delivered succeed
-    producer->>producer:acknowlege
+    producer->>producer:acknowledge
     par
         producer->>producer:close connection
         broker->>broker:close connection with producer
