@@ -10,12 +10,33 @@ EOM = b'~END_OF_MESSAGE~'
 
 logging.basicConfig(format= '[%(asctime)s %(levelname)s %(filename)s %(funcName)s - %(threadName)s] %(message)s', level=logging.DEBUG)
 
-class Broker:
+class SocketMixin:
+    def receive(self, sock, buf):
+        while True:
+            try:
+                chunk = sock.recv(BUFFER_SIZE)
+            except OSError as e:
+                chunk = b''
+                logging.debug('receive error:{}'.format(e))
+            if chunk == b'':
+                break
+            buf += chunk
+            if chunk.find(EOM) >= 0:
+                break;
+        
+        msg, sep, buf = buf.partition(EOM)
+        return bytes(msg), buf
+
+    def send(self, sock, msg):
+        sock.sendall(msg + EOM)
+
+class Broker(SocketMixin):
     def __init__(self, host, port):
         self.lock = threading.Lock()
         self.host = host
         self.port = port
         self.topics = {}
+        self.buf = bytearray()
 
     def start(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -29,24 +50,22 @@ class Broker:
 
     def handle(self, conn, addr):
         with conn:
-            action = conn.recv(BUFFER_SIZE)
+            action, self.buf = self.receive(conn, self.buf)
             logging.debug('{} - {}'.format(addr, action))
             if action == b'':
                 return
-            action = action.removesuffix(EOM)
             if action != b'sub' and action != b'pub':
-                conn.sendall(b'failed' + EOM)
+                self.send(conn, b'failed')
                 logging.debug('{} is not valid'.format(action))
                 return
-            conn.sendall(b'ok' + EOM)
+            self.send(conn, b'ok')
 
-            topic_binary = conn.recv(BUFFER_SIZE)
+            topic_binary, self.buf = self.receive(conn, self.buf)
             logging.debug('topic = {}'.format(topic_binary))
             if topic_binary == b'':
                 return
-            topic_binary = topic_binary.removesuffix(EOM)
             topic = topic_binary.decode('utf-8')
-            conn.sendall(b'ok' + EOM)
+            self.send(conn, b'ok')
             topic_queue = self.get_topic(topic)
 
             if action == b'sub':
@@ -65,54 +84,40 @@ class Broker:
 
     def handle_sub(self, conn, topic_queue):
         logging.debug('waiting consumer prepared')
-        result = conn.recv(BUFFER_SIZE)
-        if result != b'prepared' + EOM:
+        result, self.buf = self.receive(conn, self.buf)
+        if result != b'prepared':
             return
 
         while True:
             logging.debug('waiting message from queue')
             msg = topic_queue.get()
             logging.debug('get message from queue: {}'.format(msg))
-            conn.sendall(pickle.dumps(msg) + EOM)
+            self.send(conn, msg)
             logging.debug('send message to sub: {}'.format(msg))
-            result = conn.recv(BUFFER_SIZE)
-            if result != b'ok' + EOM:
+            result, self.buf = self.receive(conn, self.buf)
+            if result != b'ok':
                 break
         
         logging.debug('consumer disconnected')
 
     def handle_pub(self, conn, topic_queue):
-        msg_buf = b''
         while True:
             logging.debug('waiting message from producer')
-            chunk = conn.recv(BUFFER_SIZE)
-            if chunk == b'':
+            msg, self.buf = self.receive(conn, self.buf)
+            if msg == b'':
                 break
-            msg_buf += chunk
-            index = msg_buf.rfind(EOM)
-            exit = False
-            while index == -1:
-                chunk += conn.recv(BUFFER_SIZE)
-                if chunk == b'':
-                    exit = True
-                    break
-                msg_buf += chunk
-                index = msg_buf.rfind(EOM)
-            
-            if exit:
-                break
-
-            msg,sep,msg_buf = msg_buf.partition(EOM)
             logging.debug('get message from producer: {}'.format(msg))
             topic_queue.put(msg)
-            conn.sendall(b'ok' + EOM)
+            logging.debug('put message in queue:{}'.format(msg))
+            self.send(conn, b'ok')
         logging.debug('disconnect with producer')
                 
-class Subscriber:
+class Subscriber(SocketMixin):
     def __init__(self, host, port):
         self.host = host
         self.port = port
         self.connected = False
+        self.buf = bytearray()
 
     def connect(self, topic):
         self.close()
@@ -120,17 +125,17 @@ class Subscriber:
         self.s.connect((self.host, self.port))
         self.connected = True
         logging.debug('connected to {}:{}'.format(self.host, self.port))
-        self.s.sendall(b'sub' + EOM)
-        result = self.s.recv(BUFFER_SIZE)
-        if result != b'ok' + EOM:
+        self.send(self.s, b'sub')
+        result, self.buf = self.receive(self.s, self.buf)
+        if result != b'ok':
             logging.debug('can not start sub model, result = {}'.format(result))
             return
         logging.debug('start sub model')
 
-        topic_bytes = topic.encode('utf-8') + EOM
-        self.s.sendall(topic_bytes)
-        result = self.s.recv(BUFFER_SIZE)
-        if result != b'ok' + EOM:
+        topic_bytes = topic.encode('utf-8')
+        self.send(self.s, topic_bytes)
+        result, self.buf = self.receive(self.s, self.buf)
+        if result != b'ok':
             logging.debug('can not sub to topic, result = {}'.format(result))
             self.connected = False
             return
@@ -139,31 +144,19 @@ class Subscriber:
 
     def consume(self, callback):
         if self.connected:
-            self.s.sendall(b'prepared' + EOM)
+            self.send(self.s, b'prepared')
             msg_buf = b''        
             while True:
                 logging.debug('waiting message from broker')
-                chunk = self.s.recv(BUFFER_SIZE)
-                if chunk == b'':
-                    break
-                msg_buf += chunk
-                index = msg_buf.rfind(EOM)
-                exit = False
-                while index == -1:
-                    chunk += self.s.recv(BUFFER_SIZE)
-                    if chunk == b'':
-                        exit = True
-                        break
-                    msg_buf += chunk
-                    index = msg_buf.rfind(EOM)
-
-                if exit:
+                msg, self.buf = self.receive(self.s, self.buf)
+                if msg == b'':
                     break
 
-                msg,sep,msg_buf = msg_buf.partition(EOM)
                 logging.debug('get message from broker: {}'.format(msg))
                 self.s.sendall(b'ok' + EOM)
                 callback(msg)
+            
+            logging.debug('disconnect with broker')
     
     def close(self):
         if self.connected:
@@ -171,11 +164,12 @@ class Subscriber:
             self.s.close()
             logging.debug('shutdown and close socket')
 
-class Producer:
+class Producer(SocketMixin):
     def __init__(self, host, port):
         self.host = host
         self.port = port
         self.connected = False
+        self.buf = bytearray()
 
     def connect(self, topic):
         self.close()
@@ -183,17 +177,17 @@ class Producer:
         self.s.connect((self.host, self.port))
         self.connected = True
         logging.debug('connected to {}:{}'.format(self.host, self.port))
-        self.s.sendall(b'pub' + EOM)
-        result = self.s.recv(BUFFER_SIZE)
-        if result != b'ok' + EOM:
+        self.send(self.s, b'pub')
+        result, self.buf = self.receive(self.s, self.buf)
+        if result != b'ok':
             logging.debug('can not start pub model')
             return
         logging.debug('start pub model')
 
-        topic_bytes = topic.encode('utf-8') + EOM
-        self.s.sendall(topic_bytes)
-        result = self.s.recv(BUFFER_SIZE)
-        if result != b'ok' + EOM:
+        topic_bytes = topic.encode('utf-8')
+        self.send(self.s, topic_bytes)
+        result, self.buf = self.receive(self.s, self.buf)
+        if result != b'ok':
             logging.debug('can not pub to topic:{}'.format(topic))
             self.connect = False
             return
@@ -203,9 +197,9 @@ class Producer:
     def pub(self, msg):
         if self.connected:
             logging.debug('send message to topic: {}'.format(msg))
-            self.s.sendall(pickle.dumps(msg) + EOM)
-            result = self.s.recv(BUFFER_SIZE)
-            if result != b'ok' + EOM:
+            self.send(self.s, msg)
+            result, self.buf = self.receive(self.s, self.buf)
+            if result != b'ok':
                 logging.debug('send message error: {}'.format(msg))
                 return False
             
